@@ -42,3 +42,5 @@ pip-log.txt
 
 # Textmate (a Mac editor) meta files
 ._*
+.lh
+data

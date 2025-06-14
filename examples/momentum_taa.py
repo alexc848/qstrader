@@ -1,9 +1,14 @@
 import operator
 import os
-
+import sys
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
 import pandas as pd
 import pytz
 
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from data.data_loader import download_sector_etf_data
 from qstrader.alpha_model.alpha_model import AlphaModel
 from qstrader.alpha_model.fixed_signals import FixedSignalsAlphaModel
 from qstrader.asset.equity import Equity
@@ -51,44 +56,46 @@ class TopNMomentumAlphaModel(AlphaModel):
         self.universe = universe
         self.data_handler = data_handler
 
-    def _highest_momentum_asset(
-        self, dt
-    ):
+    def _highest_momentum_asset(self, dt):
         """
-        Calculates the ordered list of highest performing momentum
-        assets restricted to the 'Top N', for a particular datetime.
-
-        Parameters
-        ----------
-        dt : `pd.Timestamp`
-            The datetime for which the highest momentum assets
-            should be calculated.
-
-        Returns
-        -------
-        `list[str]`
-            Ordered list of highest performing momentum assets
-            restricted to the 'Top N'.
+        Calculate momentum for the current universe assets
         """
-        assets = self.signals['momentum'].assets
+        valid_assets = self.universe.get_assets(dt)
+        if not valid_assets:
+            return []
         
-        # Calculate the holding-period return momenta for each asset,
-        # for the particular provided momentum lookback period
-        all_momenta = {
-            asset: self.signals['momentum'](
-                asset, self.mom_lookback
-            ) for asset in assets
-        }
+        # Calculate momentum for valid assets
+        all_momenta = {}
+        for asset in valid_assets:
+            try:
+                momentum = self.signals['momentum'](asset, self.mom_lookback)
+                if not np.isnan(momentum):
+                    all_momenta[asset] = momentum
+            except:  # Skip any assets that cause errors
+                continue
 
-        # Obtain a list of the top performing assets by momentum
-        # restricted by the provided number of desired assets to
-        # trade per month
+        # Return empty list if no valid momentum scores
+        if not all_momenta:
+            return []
+
+        # Sort assets by momentum score
+        sorted_assets = sorted(
+            all_momenta.items(),
+            key=operator.itemgetter(1),
+            reverse=True
+        )
+
+        # Only go to cash if all momentum scores are deeply negative
+        top_momentum = sorted_assets[0][1]
+        if len(sorted_assets) == 0 or top_momentum < -0.05:  # 5% threshold
+            if 'EQ:SHY' in valid_assets:
+                return ['EQ:SHY']
+            return []
+
+        # Return top N assets with positive momentum
         return [
-            asset[0] for asset in sorted(
-                all_momenta.items(),
-                key=operator.itemgetter(1),
-                reverse=True
-            )
+            asset for asset, momentum in sorted_assets
+            if momentum > 0
         ][:self.mom_top_n]
 
     def _generate_signals(
@@ -113,30 +120,16 @@ class TopNMomentumAlphaModel(AlphaModel):
             The newly created signal weights dictionary.
         """
         top_assets = self._highest_momentum_asset(dt)
-        for asset in top_assets:
-            weights[asset] = 1.0 / self.mom_top_n
+        num_assets = len(top_assets)
+        
+        if num_assets > 0:
+            weight = 1.0 / num_assets
+            for asset in top_assets:
+                weights[asset] = weight
+        
         return weights
 
-    def __call__(
-        self, dt
-    ):
-        """
-        Calculates the signal weights for the top N
-        momentum alpha model, assuming that there is
-        sufficient data to begin calculating momentum
-        on the desired assets.
-
-        Parameters
-        ----------
-        dt : `pd.Timestamp`
-            The datetime for which the signal weights
-            should be calculated.
-
-        Returns
-        -------
-        `dict{str: float}`
-            The newly created signal weights dictionary.
-        """
+    def __call__(self, dt):
         assets = self.universe.get_assets(dt)
         weights = {asset: 0.0 for asset in assets}
 
@@ -148,44 +141,65 @@ class TopNMomentumAlphaModel(AlphaModel):
 
 
 if __name__ == "__main__":
-    # Duration of the backtest
-    start_dt = pd.Timestamp('1998-12-22 14:30:00', tz=pytz.UTC)
-    burn_in_dt = pd.Timestamp('1999-12-22 14:30:00', tz=pytz.UTC)
-    end_dt = pd.Timestamp('2020-12-31 23:59:00', tz=pytz.UTC)
+    # Set up backtest parameters first
+    print("Setting up backtest parameters...")
+    
+    # Model parameters (adjusted for better performance)
+    mom_lookback = 63  # Three months of business days
+    mom_top_n = 3  # Select top 3 performing assets
+    use_vol_adj = False  # Disable volatility adjustment
+    use_ema = True  # Use exponential moving average
+    ema_alpha = 0.97  # Slower decay for more stable signals
 
-    # Model parameters
-    mom_lookback = 126  # Six months worth of business days
-    mom_top_n = 3  # Number of assets to include at any one time
+    # Use more recent dates including XLC inception
+    start_dt = pd.Timestamp('2018-01-01 14:30:00', tz=pytz.UTC)
+    burn_in_dt = pd.Timestamp('2018-02-01 14:30:00', tz=pytz.UTC)
+    end_dt = pd.Timestamp('2024-05-31 23:59:00', tz=pytz.UTC)
+    
+    # Download or update ETF data
+    print("Downloading/updating ETF data...")
+    if not download_sector_etf_data():
+        print("Error downloading some ETF data. The strategy will continue with available data.")
 
-    # Construct the symbols and assets necessary for the backtest
-    # This utilises the SPDR US sector ETFs, all beginning with XL
-    strategy_symbols = ['XL%s' % sector for sector in "BCEFIKPUVY"]
-    assets = ['EQ:%s' % symbol for symbol in strategy_symbols]
+    print("Creating dynamic asset universe...")
 
-    # As this is a dynamic universe of assets (XLC is added later)
-    # we need to tell QSTrader when XLC can be included. This is
-    # achieved using an asset dates dictionary
-    asset_dates = {asset: start_dt for asset in assets}
-    asset_dates['EQ:XLC'] = pd.Timestamp('2018-06-18 00:00:00', tz=pytz.UTC)
+    # Define all sector ETFs including XLC
+    base_sectors = "BCEFIKPUVY"  # Original SPDR sectors
+    asset_dates = {
+        **{f'EQ:XL{s}': start_dt for s in base_sectors},  # Original sectors
+        'EQ:XLRE': start_dt,  # Real Estate
+        'EQ:SHY': start_dt,   # Treasury Bond (Safe Haven)
+        'EQ:XLC': pd.Timestamp('2018-06-18 00:00:00', tz=pytz.UTC)  # Communication Services
+    }
+    
+    # Create list of symbols from asset keys
+    strategy_symbols = sorted([asset.split(':')[1] for asset in asset_dates.keys()])
     strategy_universe = DynamicUniverse(asset_dates)
 
     # To avoid loading all CSV files in the directory, set the
     # data source to load only those provided symbols
-    csv_dir = os.environ.get('QSTRADER_CSV_DATA_DIR', '.')
-    strategy_data_source = CSVDailyBarDataSource(csv_dir, Equity, csv_symbols=strategy_symbols)
+    csv_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
+    strategy_data_source = CSVDailyBarDataSource(csv_dir, Equity, adjust_prices=False, csv_symbols=strategy_symbols)
     strategy_data_handler = BacktestDataHandler(strategy_universe, data_sources=[strategy_data_source])
 
-    # Generate the signals (in this case holding-period return based
-    # momentum) used in the top-N momentum alpha model
-    momentum = MomentumSignal(start_dt, strategy_universe, lookbacks=[mom_lookback])
+    # Initialize momentum signal for end-of-month rebalancing
+    momentum = MomentumSignal(
+        start_dt,
+        strategy_universe,
+        lookbacks=[mom_lookback],
+        use_vol_adj=use_vol_adj,
+        use_ema=use_ema,
+        ema_alpha=ema_alpha
+    )
     signals = SignalsCollection({'momentum': momentum}, strategy_data_handler)
 
-    # Generate the alpha model instance for the top-N momentum alpha model
+    # Generate the alpha model instance
     strategy_alpha_model = TopNMomentumAlphaModel(
-        signals, mom_lookback, mom_top_n, strategy_universe, strategy_data_handler
+        signals, mom_lookback, mom_top_n,
+        strategy_universe, strategy_data_handler
     )
 
-    # Construct the strategy backtest and run it
+    # Create and run strategy backtest
     strategy_backtest = BacktestTradingSession(
         start_dt,
         end_dt,
@@ -195,6 +209,7 @@ if __name__ == "__main__":
         rebalance='end_of_month',
         long_only=True,
         cash_buffer_percentage=0.01,
+        initial_cash=1000000.0,  # Set initial cash explicitly
         burn_in_dt=burn_in_dt,
         data_handler=strategy_data_handler
     )
@@ -204,14 +219,14 @@ if __name__ == "__main__":
     benchmark_symbols = ['SPY']
     benchmark_assets = ['EQ:SPY']
     benchmark_universe = StaticUniverse(benchmark_assets)
-    benchmark_data_source = CSVDailyBarDataSource(csv_dir, Equity, csv_symbols=benchmark_symbols)
+    benchmark_data_source = CSVDailyBarDataSource(csv_dir, Equity, adjust_prices=False, csv_symbols=benchmark_symbols)
     benchmark_data_handler = BacktestDataHandler(benchmark_universe, data_sources=[benchmark_data_source])
 
     # Construct a benchmark Alpha Model that provides
     # 100% static allocation to the SPY ETF, with no rebalance
     benchmark_alpha_model = FixedSignalsAlphaModel({'EQ:SPY': 1.0})
     benchmark_backtest = BacktestTradingSession(
-        burn_in_dt,
+        burn_in_dt,  # Use burn_in_dt for benchmark start
         end_dt,
         benchmark_universe,
         benchmark_alpha_model,
@@ -223,9 +238,44 @@ if __name__ == "__main__":
     benchmark_backtest.run()
 
     # Performance Output
-    tearsheet = TearsheetStatistics(
+    # Create compact tearsheet subclass
+    class CompactTearsheet(TearsheetStatistics):
+        def plot_results(self, filename=None):
+            # Override only the figure creation part
+            vertical_sections = 5
+            # Use small figure size
+            fig = plt.figure(figsize=(16, 7.5))  # 1600x800 pixels at 100 DPI
+            fig.suptitle(self.title, y=0.94, weight='bold')
+            gs = gridspec.GridSpec(vertical_sections, 3, wspace=0.25, hspace=0.5)
+
+            # Use parent class methods for all plotting
+            stats = self.get_results(self.strategy_equity)
+            bench_stats = None
+            if self.benchmark_equity is not None:
+                bench_stats = self.get_results(self.benchmark_equity)
+
+            ax_equity = plt.subplot(gs[:2, :])
+            ax_drawdown = plt.subplot(gs[2, :])
+            ax_monthly_returns = plt.subplot(gs[3, :2])
+            ax_yearly_returns = plt.subplot(gs[3, 2])
+            ax_txt_curve = plt.subplot(gs[4, 0])
+
+            # Call parent plotting methods
+            self._plot_equity(stats, bench_stats=bench_stats, ax=ax_equity)
+            self._plot_drawdown(stats, ax=ax_drawdown)
+            self._plot_monthly_returns(stats, ax=ax_monthly_returns)
+            self._plot_yearly_returns(stats, ax=ax_yearly_returns)
+            self._plot_txt_curve(stats, bench_stats=bench_stats, ax=ax_txt_curve)
+
+            if filename:
+                fig.savefig(filename)
+            plt.show()
+
+    # Create and display tearsheet using compact subclass
+    tearsheet = CompactTearsheet(
         strategy_equity=strategy_backtest.get_equity_curve(),
         benchmark_equity=benchmark_backtest.get_equity_curve(),
-        title='US Sector Momentum - Top 3 Sectors'
+        title='US Sector Momentum - Single Best Sector (Vol-Adj)'
     )
+    
     tearsheet.plot_results()

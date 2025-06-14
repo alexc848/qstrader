@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from qstrader.signals.signal import Signal
+from qstrader.signals.vol import VolatilitySignal
 
 
 class MomentumSignal(Signal):
@@ -24,9 +25,29 @@ class MomentumSignal(Signal):
         The number of lookback periods to store prices for.
     """
 
-    def __init__(self, start_dt, universe, lookbacks):
+    def __init__(self, start_dt, universe, lookbacks, use_vol_adj=True, use_ema=False, ema_alpha=0.94):
+        """
+        Parameters
+        ----------
+        start_dt : `pd.Timestamp`
+            The starting datetime (UTC) of the signal.
+        universe : `Universe`
+            The universe of assets to calculate the signals for.
+        lookbacks : `list[int]`
+            The number of lookback periods to store prices for.
+        use_vol_adj : `bool`
+            Whether to adjust momentum by volatility.
+        use_ema : `bool`
+            Whether to use exponential moving average for returns.
+        ema_alpha : `float`
+            The decay factor for EMA calculation.
+        """
         bumped_lookbacks = [lookback + 1 for lookback in lookbacks]
         super().__init__(start_dt, universe, bumped_lookbacks)
+        self.vol_signal = VolatilitySignal(start_dt, universe, lookbacks)
+        self.use_vol_adj = use_vol_adj
+        self.use_ema = use_ema
+        self.ema_alpha = ema_alpha
 
     @staticmethod
     def _asset_lookback_key(asset, lookback):
@@ -69,12 +90,25 @@ class MomentumSignal(Signal):
         series = pd.Series(
             self.buffers.prices[MomentumSignal._asset_lookback_key(asset, lookback)]
         )
-        returns = series.pct_change().dropna().to_numpy()
+        returns = series.pct_change().dropna()
 
         if len(returns) < 1:
             return 0.0
-        else:
-            return (np.cumprod(1.0 + np.array(returns)) - 1.0)[-1]
+
+        if self.use_ema:
+            # Apply exponential moving average to returns
+            returns = returns.ewm(alpha=self.ema_alpha).mean()
+
+        returns = returns.to_numpy()
+        momentum = (np.cumprod(1.0 + np.array(returns)) - 1.0)[-1]
+
+        if self.use_vol_adj:
+            volatility = self.vol_signal(asset, lookback)
+            if volatility > 0:
+                return momentum / volatility
+            return 0.0
+        
+        return momentum
 
     def __call__(self, asset, lookback):
         """
